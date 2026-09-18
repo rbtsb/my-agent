@@ -4,6 +4,6 @@ models/
 uploads/
 __pycache__/
 *.pyc
-proposal/node_modules/
+proposal/
 bems_slides.pptx
 knowledge_base.md
