@@ -1,0 +1,13 @@
+openai
+python-dotenv
+psycopg2-binary
+pymilvus
+flask
+langgraph
+pypdf
+python-docx
+pdf2image
+pytesseract
+openpyxl
+python-pptx
+Pillow

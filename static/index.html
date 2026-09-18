@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Agent Chat</title>
+<style>
+  :root {
+    --bg: #f4f6fa; --card: #ffffff; --ink: #1b1f2b;
+    --muted: #6b7280; --field-bg: #e8f0fe; --blue: #0b5fff; --border: #e3e7f0;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", Tahoma, sans-serif; background: var(--bg); color: var(--ink); display: flex; flex-direction: column; height: 100vh; }
+  header { background: var(--card); color: var(--ink); padding: 16px 20px; font-weight: 600; border-bottom: 1px solid var(--border); }
+  header small { display: block; font-weight: normal; color: var(--muted); font-size: 12px; margin-top: 2px; }
+  #chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 70%; padding: 10px 14px; border-radius: 16px; line-height: 1.5; white-space: pre-wrap; }
+  .msg-table { white-space: normal; border-collapse: collapse; width: 100%; margin: 6px 0; font-size: 13px; }
+  .msg-table th, .msg-table td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+  .msg-table th { background: var(--field-bg); color: var(--ink); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.02em; }
+  .msg-table tbody tr:nth-child(even) { background: rgba(11, 95, 255, 0.04); }
+  .msg-table tbody tr:hover { background: rgba(11, 95, 255, 0.08); }
+  .user { align-self: flex-end; background: var(--blue); color: white; }
+  .bot { align-self: flex-start; background: var(--card); border: 1px solid var(--border); }
+  .error { align-self: center; color: #a33; font-size: 13px; }
+
+  #inputRow { display: flex; padding: 16px; gap: 10px; border-top: 1px solid var(--border); background: var(--card); }
+  #inputRow input[type=text] { flex: 1; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; font-size: 14px; background: var(--bg); }
+  #inputRow button { padding: 12px 22px; border: none; border-radius: 10px; background: var(--blue); color: white; font-weight: 600; cursor: pointer; }
+  #inputRow button:disabled { opacity: 0.5; cursor: default; }
+  #attach { flex: 0 0 auto; padding: 12px 16px; background: var(--blue); font-size: 18px; display: flex; align-items: center; justify-content: center; }
+  #attach .icon { filter: brightness(0) invert(1); } /* forces the emoji glyph to render as plain white, not its default color */
+
+  /* Bottom-sheet interrupt UI, styled after the Tunoo "Review & send" pattern — this markup
+     knows nothing about "priority" or "days", only about field TYPES from interrupt_protocol.py,
+     so a brand-new field type is the only thing that ever needs a new branch below. */
+  #overlay {
+    position: fixed; inset: 0; background: rgba(20, 24, 50, 0.45);
+    display: flex; align-items: flex-end; justify-content: center;
+    opacity: 0; pointer-events: none; transition: opacity 0.15s ease;
+  }
+  #overlay.open { opacity: 1; pointer-events: auto; }
+  .sheet {
+    background: var(--bg); width: 100%; max-width: 480px;
+    border-radius: 20px 20px 0 0; padding: 12px 20px 20px;
+    box-shadow: 0 -8px 30px rgba(0,0,0,0.2);
+    transform: translateY(20px); transition: transform 0.15s ease;
+  }
+  #overlay.open .sheet { transform: translateY(0); }
+  .sheet .handle { width: 36px; height: 4px; background: #ccc; border-radius: 2px; margin: 0 auto 14px; }
+  .sheet .title { text-align: center; font-size: 17px; font-weight: 600; margin-bottom: 18px; }
+
+  .field { background: var(--field-bg); border-radius: 14px; padding: 14px 16px; margin-bottom: 12px; }
+  .field .label { font-size: 12px; color: var(--muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.03em; }
+  .option-row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .option { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; background: white; border: 1px solid #cfd8ef; border-radius: 18px; font-size: 14px; cursor: pointer; }
+  .option.checked { border-color: var(--blue); background: #dce8ff; }
+  .custom-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .custom-row input[type=text] { flex: 1; padding: 8px 10px; border: 1px solid #cfd8ef; border-radius: 8px; background: white; }
+
+  .sheet button.submit { width: 100%; padding: 15px; border: none; border-radius: 12px; background: var(--blue); color: white; font-weight: 700; font-size: 16px; cursor: pointer; margin-top: 6px; }
+  .sheet button.submit:disabled { opacity: 0.5; cursor: default; }
+
+  .date-input { width: 100%; padding: 10px 12px; border: 1px solid #cfd8ef; border-radius: 8px; background: white; font-size: 15px; }
+
+  .confirm-buttons { display: flex; gap: 10px; }
+  .confirm-buttons button { flex: 1; padding: 15px; border: none; border-radius: 12px; font-weight: 700; font-size: 16px; cursor: pointer; }
+  .confirm-buttons .yes { background: var(--blue); color: white; }
+  .confirm-buttons .no { background: var(--border); color: var(--ink); }
+</style>
+</head>
+<body>
+  <header>Agent Chat<small>Tasks, weather, CRM lookups, and company knowledge — all in one place</small></header>
+  <div id="chat"></div>
+  <div id="inputRow">
+    <button id="attach" title="Attach a file"><span class="icon">📎</span></button>
+    <input id="fileInput" type="file" accept=".txt,.md,.csv,.json,.pdf,.docx,.xlsx,.pptx,.jpg,.jpeg,.png" hidden />
+    <input id="input" type="text" placeholder="Type a message..." autofocus />
+    <button id="send">Send</button>
+  </div>
+
+  <div id="overlay"><div class="sheet" id="sheet"></div></div>
+
+<script>
+const chat = document.getElementById("chat");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+const overlay = document.getElementById("overlay");
+const sheet = document.getElementById("sheet");
+const attachBtn = document.getElementById("attach");
+const fileInput = document.getElementById("fileInput");
+
+// Minimal, safe Markdown rendering for bot messages: pipe tables and **bold** only — everything
+// else stays plain text. Builds real DOM nodes throughout (no innerHTML of model-controlled text),
+// so this can't become an XSS vector no matter what the model outputs.
+function appendInlineMarkdown(parent, text) {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  for (const part of parts) {
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+      const strong = document.createElement("strong");
+      strong.textContent = part.slice(2, -2);
+      parent.appendChild(strong);
+    } else if (part) {
+      parent.appendChild(document.createTextNode(part));
+    }
+  }
+}
+
+function isTableSeparatorRow(line) {
+  return /^\|?[\s:|-]+\|?$/.test(line) && line.includes("-");
+}
+
+function parseTableCells(line) {
+  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  return trimmed.split("|").map((cell) => cell.trim());
+}
+
+function renderMarkdownTable(container, lines) {
+  const table = document.createElement("table");
+  table.className = "msg-table";
+  const headerCells = parseTableCells(lines[0]);
+
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  headerCells.forEach((cell) => {
+    const th = document.createElement("th");
+    appendInlineMarkdown(th, cell);
+    headRow.appendChild(th);
+  });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  for (let i = 2; i < lines.length; i++) {
+    const row = document.createElement("tr");
+    parseTableCells(lines[i]).forEach((cell) => {
+      const td = document.createElement("td");
+      appendInlineMarkdown(td, cell);
+      row.appendChild(td);
+    });
+    tbody.appendChild(row);
+  }
+  table.appendChild(tbody);
+  container.appendChild(table);
+}
+
+function addMessage(text, cls) {
+  const div = document.createElement("div");
+  div.className = "msg " + cls;
+
+  const lines = text.split("\n");
+  let i = 0;
+  let textBuffer = [];
+
+  function flushTextBuffer() {
+    if (textBuffer.length === 0) return;
+    const p = document.createElement("div");
+    appendInlineMarkdown(p, textBuffer.join("\n"));
+    div.appendChild(p);
+    textBuffer = [];
+  }
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const isTableStart = line.trim().startsWith("|") && i + 1 < lines.length && isTableSeparatorRow(lines[i + 1].trim());
+    if (isTableStart) {
+      flushTextBuffer();
+      let end = i + 2;
+      while (end < lines.length && lines[end].trim().startsWith("|")) end++;
+      renderMarkdownTable(div, lines.slice(i, end));
+      i = end;
+    } else {
+      textBuffer.push(line);
+      i++;
+    }
+  }
+  flushTextBuffer();
+
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function setBusy(busy) {
+  sendBtn.disabled = busy;
+  input.disabled = busy;
+  attachBtn.disabled = busy;
+  // Disabling an input drops browser focus even after re-enabling it — put it back so the user
+  // can keep typing without an extra click.
+  if (!busy) input.focus();
+}
+
+async function submitResume(payload, values) {
+  overlay.classList.remove("open");
+  const res = await fetch("/api/resume", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ protocol: payload.protocol, interrupt_id: payload.interrupt_id, values }),
+  });
+  handleResult(await res.json());
+}
+
+async function submitCancel(payload) {
+  overlay.classList.remove("open");
+  const res = await fetch("/api/resume", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ protocol: payload.protocol, interrupt_id: payload.interrupt_id, cancelled: true }),
+  });
+  handleResult(await res.json());
+}
+
+// Renders ANY interrupt_protocol.py payload as a bottom sheet — adding a new field "type"
+// later only needs a new branch here, the protocol shape itself doesn't change.
+function renderInterrupt(payload) {
+  sheet.innerHTML = "";
+
+  const handle = document.createElement("div");
+  handle.className = "handle";
+  sheet.appendChild(handle);
+
+  const titleEl = document.createElement("div");
+  titleEl.className = "title";
+  titleEl.textContent = payload.title;
+  sheet.appendChild(titleEl);
+
+  // "confirm" is a self-contained yes/no decision — it submits itself on click, no separate
+  // submit button, no other field types alongside it.
+  if (payload.fields.length === 1 && payload.fields[0].type === "confirm") {
+    const field = payload.fields[0];
+    const row = document.createElement("div");
+    row.className = "confirm-buttons";
+    row.innerHTML = `<button class="no">${field.no_label}</button><button class="yes">${field.yes_label}</button>`;
+    row.querySelector(".yes").onclick = () => submitResume(payload, { [field.name]: ["yes"] });
+    row.querySelector(".no").onclick = () => submitResume(payload, { [field.name]: ["no"] });
+    sheet.appendChild(row);
+    overlay.classList.add("open");
+    return;
+  }
+
+  const fieldEls = {}; // name -> {getValues(): string[]}
+
+  payload.fields.forEach((field) => {
+    const fieldDiv = document.createElement("div");
+    fieldDiv.className = "field";
+
+    const label = document.createElement("div");
+    label.className = "label";
+    label.textContent = field.label;
+    fieldDiv.appendChild(label);
+
+    if (field.type === "choice") {
+      const optionRow = document.createElement("div");
+      optionRow.className = "option-row";
+      const optionEls = [];
+
+      field.options.forEach((opt) => {
+        const chip = document.createElement("label");
+        chip.className = "option";
+        const optInput = document.createElement("input");
+        optInput.type = field.multiple ? "checkbox" : "radio";
+        optInput.name = field.name;
+        optInput.value = opt.value;
+        optInput.style.display = "none";
+        optInput.onchange = () => syncChipStyles();
+        chip.appendChild(optInput);
+        chip.appendChild(document.createTextNode(opt.label));
+        chip.onclick = (e) => { e.preventDefault(); optInput.checked = field.multiple ? !optInput.checked : true; if (!field.multiple) optionEls.forEach(o => { if (o !== optInput) o.checked = false; }); syncChipStyles(); };
+        optionRow.appendChild(chip);
+        optionEls.push(optInput);
+      });
+      fieldDiv.appendChild(optionRow);
+
+      function syncChipStyles() {
+        optionEls.forEach((o) => o.closest(".option").classList.toggle("checked", o.checked));
+      }
+
+      let customInput = null;
+      if (field.allow_custom) {
+        const row = document.createElement("div");
+        row.className = "custom-row";
+        customInput = document.createElement("input");
+        customInput.type = "text";
+        customInput.placeholder = field.custom_label;
+        row.appendChild(customInput);
+        fieldDiv.appendChild(row);
+      }
+
+      fieldEls[field.name] = {
+        getValues() {
+          const values = [];
+          field.options.forEach((opt, i) => { if (optionEls[i].checked) values.push(opt.value); });
+          if (customInput && customInput.value.trim()) values.push(customInput.value.trim());
+          return values;
+        },
+      };
+    }
+
+    if (field.type === "date") {
+      const dateInput = document.createElement("input");
+      dateInput.type = "date";
+      dateInput.className = "date-input";
+      fieldDiv.appendChild(dateInput);
+      fieldEls[field.name] = { getValues: () => (dateInput.value ? [dateInput.value] : []) };
+    }
+
+    sheet.appendChild(fieldDiv);
+  });
+
+  const buttonRow = document.createElement("div");
+  buttonRow.className = "confirm-buttons";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "no";
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.onclick = () => submitCancel(payload);
+  buttonRow.appendChild(cancelBtn);
+
+  const submitBtn = document.createElement("button");
+  submitBtn.className = "yes";
+  submitBtn.textContent = "Confirm";
+  submitBtn.onclick = () => {
+    const values = {};
+    for (const name in fieldEls) values[name] = fieldEls[name].getValues();
+    submitBtn.disabled = true;
+    submitResume(payload, values);
+  };
+  buttonRow.appendChild(submitBtn);
+
+  sheet.appendChild(buttonRow);
+  overlay.classList.add("open");
+}
+
+function handleResult(result) {
+  if (result.type === "text") {
+    addMessage(result.message, "bot");
+    setBusy(false);
+  } else if (result.type === "interrupt") {
+    setBusy(false);
+    renderInterrupt(result.payload);
+  } else {
+    addMessage("Error: " + result.message, "error");
+    setBusy(false);
+  }
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text) return;
+  addMessage(text, "user");
+  input.value = "";
+  setBusy(true);
+  const res = await fetch("/api/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message: text }),
+  });
+  handleResult(await res.json());
+}
+
+async function uploadFile(file) {
+  addMessage(`📎 ${file.name}`, "user");
+  setBusy(true);
+  const formData = new FormData();
+  formData.append("file", file);
+  const res = await fetch("/api/upload", { method: "POST", body: formData });
+  handleResult(await res.json());
+}
+
+sendBtn.onclick = send;
+input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+attachBtn.onclick = () => fileInput.click();
+fileInput.addEventListener("change", () => {
+  if (fileInput.files[0]) uploadFile(fileInput.files[0]);
+  fileInput.value = ""; // allow re-selecting the same file later
+});
+</script>
+</body>
+</html>
