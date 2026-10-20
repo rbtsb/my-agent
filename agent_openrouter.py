@@ -1,33 +1,32 @@
 """
-Unified agent — the main chat. Combines everything built across this project into one LangGraph:
+BEMS Agent — the main chat. One LangGraph that combines:
 - RAG (Milvus + TEI) for knowledge-base questions
-- Simple tools: list_tasks, get_weather, query_crm_database (reads run immediately)
-- Structured, cancellable human-in-the-loop for anything consequential:
-    * schedule_task — appointment (asks a DATE) or reminder (asks DAY(S) OF WEEK), with slot
-      filling (skips the question if the user already said it) and full cancel support
-    * delete_task — plain yes/no confirm
-    * query_crm_database writes (INSERT/UPDATE/DELETE) — plain yes/no confirm
-  All of these use interrupt_protocol.py, so the web UI (or any future client) renders them from
-  one shared JSON schema instead of the agent knowing anything about HTML.
+- Live budget data: balance, transactions, budgets, assets (budget-management-system API)
+- query_crm_database: SELECTs run immediately; INSERT/UPDATE/DELETE wait for a yes/no confirm
+- open_entry_form: a prefilled, validated bottom sheet to record an expense, income, budget or asset
+  All human-in-the-loop steps use interrupt_protocol.py, so the web UI (or any future client) renders
+  them from one shared JSON schema instead of the agent knowing anything about HTML.
 
 Run:
     pip install -r requirements.txt
     docker compose up -d
-    python agent_openrouter.py "what are my tasks?"          # one-shot
+    python agent_openrouter.py "what's my balance?"          # one-shot
     python agent_openrouter.py                                # interactive terminal
     python web_app.py                                          # web UI, see static/index.html
 """
 
+import datetime
 import io
 import json
+import re
 import operator
 import os
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+from decimal import Decimal, InvalidOperation
 from typing import Annotated, List, Optional, TypedDict
 
 import psycopg2
@@ -37,14 +36,13 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from openai import OpenAI, RateLimitError
 
-from interrupt_protocol import choice_interrupt, confirm_interrupt, date_interrupt, field_values, is_cancelled, is_confirmed
+from interrupt_protocol import choice_field, confirm_interrupt, first_value, form_field, form_interrupt, is_cancelled, is_confirmed
 
 load_dotenv(Path(__file__).parent / ".env")
 
 # Windows terminals default to cp1252, which can't encode characters like '°' — force UTF-8.
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
-STATE_FILE = Path(__file__).parent / "tasks.json"
 KNOWLEDGE_BASE_FILE = Path(__file__).parent / "knowledge_base.md"  # kept only for reference/embedding script
 
 # Overridable via env vars: "localhost" is correct when running on the host, but wrong from
@@ -61,6 +59,7 @@ RAG_TOP_K = 3
 BUDGET_API_BASE_URL = os.environ.get("BUDGET_API_BASE_URL", "http://localhost:8090")
 BUDGET_API_KEY = os.environ.get("BUDGET_API_KEY", "")
 BUDGET_PERSON_ID = int(os.environ.get("BUDGET_PERSON_ID", "0"))
+DEFAULT_CURRENCY = os.environ.get("DEFAULT_CURRENCY", "MYR")
 
 MODEL = "nvidia/nemotron-3-super-120b-a12b:free"  # pick any tool-calling model from https://openrouter.ai/models
 
@@ -127,29 +126,26 @@ def base_system_message():
     today = datetime.date.today().isoformat()
     return {
         "role": "system",
-        "content": f"Today's date is {today}. You help the user manage tasks, check weather, "
-        "query the CRM database, track their personal budget (balance, income/expense entries, "
+        "content": f"Today's date is {today}. You are BEMS Agent. You help the user query the CRM database, track their personal budget (balance, income/expense entries, "
         "category budgets), and answer questions about the company using the knowledge-base "
         "excerpts provided in context. Answer directly, the way a colleague who already knows "
         "this would.\n\n"
-        "For budget tools: get_balance/list_transactions/list_budgets/create_or_update_budget run "
-        "immediately, no confirmation needed. create_transaction (recording income or an expense) "
-        "always shows an automatic confirm/cancel UI before posting, so call it directly as soon as "
-        "the amount and type (INCOME/EXPENSE) are clear — never ask for confirmation in text first. "
+        "For budget tools: get_balance/list_transactions/list_budgets/list_assets run immediately. "
+        "To RECORD anything financial — an expense, an income, a budget (spending limit) or an asset "
+        "the user now owns — call open_entry_form. It opens an editable form sheet prefilled with "
+        "whatever you extracted; the user completes and submits it, so call it immediately even when "
+        "the amount or other details are missing, and never ask for them in text first. Pick "
+        "entry_type: ASSET for a durable thing bought or owned (phone, laptop, car, bike, jewelry, "
+        "furniture) — the form also offers to record the purchase price as an expense; EXPENSE for "
+        "consumption (food, rent, bills, taxi, subscriptions); INCOME for money received; BUDGET for a "
+        "spending limit. Only prefill values the user actually stated or clearly implied (resolve "
+        "'today'/'yesterday' to ISO dates) — never invent an amount. "
         "Always convert an informal currency name the user says (e.g. 'RM', 'ringgit') to its "
         "3-letter ISO-4217 code (MYR) before calling any budget tool that takes a currency. "
-        "list_transactions and list_budgets already return a Markdown table, pre-formatted and ready "
+        "list_transactions, list_budgets and list_assets already return a Markdown table, pre-formatted and ready "
         "to display — repeat that table back to the user EXACTLY as given (same pipes, same rows), "
         "with at most one short sentence before it. Never convert it to JSON, prose, or a bulleted "
         "list, and never re-summarize the numbers into a paragraph instead of showing the table.\n\n"
-        "For schedule_task: as soon as you know the title and kind, call the tool immediately — "
-        "even with date/days missing. A UI automatically asks the user for whatever's missing "
-        "after you call it, so never ask for the date or days yourself in plain text first, and "
-        "never wait to have every field before calling. If the user only says 'schedule an "
-        "appointment' with no title yet, that's the one thing worth asking about in plain text, "
-        "since it's not something the interrupt UI collects. If the user gave a relative date "
-        "('tomorrow', 'next Friday'), resolve it yourself using today's date above and pass the "
-        "resulting ISO date instead of leaving it unset.\n\n"
         "For any tool that mentions an automatic confirm/cancel UI: call it directly as soon as the "
         "user's request is clear. Never ask for confirmation in plain text yourself, and never treat "
         "a typed 'yes' as approval — the only real approval is the user clicking Confirm in that UI, "
@@ -157,22 +153,6 @@ def base_system_message():
     }
 
 TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "list_tasks",
-            "description": "List all current tasks.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get the current weather for a city name.",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
-        },
-    },
     {
         "type": "function",
         "function": {
@@ -184,28 +164,6 @@ TOOLS = [
                 "is written."
             ),
             "parameters": {"type": "object", "properties": {"sql": {"type": "string"}}, "required": ["sql"]},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "schedule_task",
-            "description": (
-                "Schedule a new task. kind='appointment' for a one-off task tied to a specific day "
-                "(e.g. 'call the dentist tomorrow') — needs a DATE. kind='reminder' for something "
-                "recurring on certain weekdays (e.g. 'remind me to drink water') — needs DAY(S) OF "
-                "WEEK."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "kind": {"type": "string", "enum": ["appointment", "reminder"]},
-                    "date": {"type": "string", "description": "ISO date (YYYY-MM-DD) if already known"},
-                    "days": {"type": "array", "items": {"type": "string"}, "description": "weekdays if already known"},
-                },
-                "required": ["title", "kind"],
-            },
         },
     },
     {
@@ -223,25 +181,30 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "create_transaction",
+            "name": "open_entry_form",
             "description": (
-                "Record an income or expense in the user's budget account and update their balance. "
-                "type='INCOME' for money received (salary, refund, transfer in), type='EXPENSE' for "
-                "money spent (purchase, bill, transfer out) — always send a positive amount, the type "
-                "carries the sign. Resolve any informal currency name (e.g. 'RM') to its 3-letter "
-                "ISO-4217 code (e.g. MYR) before calling. Call this directly as soon as the amount and "
-                "type are clear — a confirm/cancel UI is shown automatically before anything is posted."
+                "Open a prefilled data-entry bottom sheet to record an EXPENSE, INCOME, BUDGET or ASSET. "
+                "The user reviews/edits every field and submits — nothing is saved before that. Put only "
+                "values the user stated into prefill; leave unknown ones out."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "type": {"type": "string", "enum": ["INCOME", "EXPENSE"]},
-                    "amount": {"type": "number", "description": "Always positive."},
-                    "currency": {"type": "string", "description": "3-letter ISO-4217 code, e.g. MYR"},
-                    "category": {"type": "string", "description": "e.g. salary, groceries, rent"},
-                    "description": {"type": "string"},
+                    "entry_type": {"type": "string", "enum": ["EXPENSE", "INCOME", "BUDGET", "ASSET"]},
+                    "prefill": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "ASSET only: what the item is, e.g. 'iPhone 16'"},
+                            "amount": {"type": "number", "description": "Positive. Price / value / limit."},
+                            "currency": {"type": "string", "description": "3-letter ISO-4217 code, e.g. MYR"},
+                            "category": {"type": "string", "description": "e.g. electronics, groceries, salary"},
+                            "date": {"type": "string", "description": "ISO date YYYY-MM-DD"},
+                            "period": {"type": "string", "enum": ["WEEKLY", "MONTHLY", "YEARLY"]},
+                            "description": {"type": "string"},
+                        },
+                    },
                 },
-                "required": ["type", "amount"],
+                "required": ["entry_type"],
             },
         },
     },
@@ -259,27 +222,6 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "create_or_update_budget",
-            "description": (
-                "Set a spending limit (budget) for a category, e.g. 'set a budget of 500 for groceries "
-                "every month'. Calling it again for the same category/period replaces the previous "
-                "limit rather than creating a duplicate. Runs immediately, no confirmation needed."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "category": {"type": "string"},
-                    "limit_amount": {"type": "number"},
-                    "currency": {"type": "string", "description": "3-letter ISO-4217 code, e.g. MYR"},
-                    "period": {"type": "string", "enum": ["WEEKLY", "MONTHLY", "YEARLY"]},
-                },
-                "required": ["category", "limit_amount", "period"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "list_budgets",
             "description": "List every budget (spending limit) the user has set, across all categories.",
             "parameters": {"type": "object", "properties": {}},
@@ -288,33 +230,12 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "delete_task",
-            "description": (
-                "Delete a task by its id. Call this directly as soon as the user names which task "
-                "— a confirm/cancel UI is shown automatically before anything is deleted."
-            ),
-            "parameters": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]},
+            "name": "list_assets",
+            "description": "List the assets (owned items such as a phone, laptop or car) the user has recorded.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
 ]
-
-
-def load_state():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    return {"tasks": [], "next_id": 1}
-
-
-def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _format_task(t):
-    if t.get("kind") == "appointment":
-        return f"[{t['id']}] {t['title']} — {t.get('date', '?')}"
-    if t.get("kind") == "reminder":
-        return f"[{t['id']}] {t['title']} — every {', '.join(t.get('days') or [])}"
-    return f"[{t['id']}] {t['title']}"
 
 
 def _run_sql(sql: str) -> str:
@@ -348,13 +269,8 @@ def _is_write_sql(sql: str) -> bool:
 
 class AgentState(TypedDict):
     messages: Annotated[List[dict], operator.add]
-    title: Optional[str]
-    kind: Optional[str]
-    date: Optional[str]
-    days: Optional[List[str]]
-    delete_id: Optional[int]
     pending_sql: Optional[str]
-    pending_transaction: Optional[dict]
+    pending_entry: Optional[dict]  # {form_id, entry_type, prefill} while an entry sheet is open
 
 
 def _tool_msg(call_id, content):
@@ -376,15 +292,6 @@ def agent_node(state: AgentState):
     name = call.function.name
     args = json.loads(call.function.arguments or "{}")
 
-    if name == "list_tasks":
-        st = load_state()
-        result = "\n".join(_format_task(t) for t in st["tasks"]) if st["tasks"] else "No tasks."
-        return Command(update={"messages": [assistant_message, _tool_msg(call.id, result)]}, goto="agent")
-
-    if name == "get_weather":
-        result = _get_weather(args["city"])
-        return Command(update={"messages": [assistant_message, _tool_msg(call.id, result)]}, goto="agent")
-
     if name == "query_crm_database":
         sql = args["sql"].strip()
         if _is_write_sql(sql):
@@ -392,18 +299,6 @@ def agent_node(state: AgentState):
             return Command(update=update, goto="ask_db_confirm")
         result = _run_sql(sql)
         return Command(update={"messages": [assistant_message, _tool_msg(call.id, result)]}, goto="agent")
-
-    if name == "schedule_task":
-        update = {
-            "messages": [assistant_message, _tool_msg(call.id, "Collecting the remaining details.")],
-            "title": args["title"], "kind": args["kind"], "date": args.get("date"), "days": args.get("days"),
-        }
-        goto = "ask_date" if args["kind"] == "appointment" else "ask_days"
-        return Command(update=update, goto=goto)
-
-    if name == "delete_task":
-        update = {"messages": [assistant_message, _tool_msg(call.id, "Awaiting confirmation.")], "delete_id": args["task_id"]}
-        return Command(update=update, goto="ask_delete_confirm")
 
     if name == "get_balance":
         result = _budget_result(_get_balance)
@@ -417,14 +312,20 @@ def agent_node(state: AgentState):
         result = _budget_text_result(lambda: _format_budgets_table(_list_budgets()))
         return Command(update={"messages": [assistant_message, _tool_msg(call.id, result)]}, goto="agent")
 
-    if name == "create_or_update_budget":
-        result = _budget_result(lambda: _create_or_update_budget(
-            args["category"], args["limit_amount"], args.get("currency"), args.get("period", "MONTHLY")))
+    if name == "list_assets":
+        result = _budget_text_result(lambda: _format_assets_table(_list_assets()))
         return Command(update={"messages": [assistant_message, _tool_msg(call.id, result)]}, goto="agent")
 
-    if name == "create_transaction":
-        update = {"messages": [assistant_message, _tool_msg(call.id, "Awaiting confirmation.")], "pending_transaction": args}
-        return Command(update=update, goto="ask_transaction_confirm")
+    if name == "open_entry_form":
+        entry_type = str(args.get("entry_type", "")).upper()
+        if entry_type not in ENTRY_TYPES:
+            result = f"Invalid entry_type {entry_type!r}; use one of {', '.join(ENTRY_TYPES)}."
+            return Command(update={"messages": [assistant_message, _tool_msg(call.id, result)]}, goto="agent")
+        update = {
+            "messages": [assistant_message, _tool_msg(call.id, "Entry form opened for the user.")],
+            "pending_entry": new_pending_entry(entry_type, args.get("prefill")),
+        }
+        return Command(update=update, goto="entry_form")
 
     return Command(update={"messages": [assistant_message, _tool_msg(call.id, f"Unknown tool: {name}")]}, goto="agent")
 
@@ -474,21 +375,6 @@ def _format_budgets_table(budgets: list) -> str:
     return "\n".join(lines)
 
 
-def _get_weather(city: str) -> str:
-    geo_url = "https://geocoding-api.open-meteo.com/v1/search?" + urllib.parse.urlencode({"name": city, "count": 1})
-    with urllib.request.urlopen(geo_url, timeout=10) as resp:
-        geo = json.load(resp)
-    if not geo.get("results"):
-        return f"Could not find location: {city}"
-    lat, lon = geo["results"][0]["latitude"], geo["results"][0]["longitude"]
-    weather_url = "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(
-        {"latitude": lat, "longitude": lon, "current": "temperature_2m,wind_speed_10m"}
-    )
-    with urllib.request.urlopen(weather_url, timeout=10) as resp:
-        current = json.load(resp)["current"]
-    return f"{city}: {current['temperature_2m']}°C, wind {current['wind_speed_10m']} km/h"
-
-
 def _budget_request(method: str, path: str, body: dict = None):
     url = BUDGET_API_BASE_URL.rstrip("/") + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -508,103 +394,12 @@ def _get_balance() -> dict:
     return _budget_request("GET", f"/api/v1/persons/{BUDGET_PERSON_ID}/balance")
 
 
-def _create_transaction(type_: str, amount, currency: str = None, category: str = None,
-                         description: str = None, idempotency_key: str = None) -> dict:
-    body = {"personId": BUDGET_PERSON_ID, "type": type_, "amount": amount}
-    if currency:
-        body["currency"] = currency
-    if category:
-        body["category"] = category
-    if description:
-        body["description"] = description
-    if idempotency_key:
-        body["idempotencyKey"] = idempotency_key
-    return _budget_request("POST", "/api/v1/transactions", body)
-
-
 def _list_transactions(limit: int = 10) -> dict:
     return _budget_request("GET", f"/api/v1/persons/{BUDGET_PERSON_ID}/transactions?size={int(limit)}")
 
 
-def _create_or_update_budget(category: str, limit_amount, currency: str = None, period: str = "MONTHLY") -> dict:
-    body = {
-        "personId": BUDGET_PERSON_ID, "category": category, "limitAmount": limit_amount,
-        "currency": currency or "MYR", "period": period,
-    }
-    return _budget_request("POST", "/api/v1/budgets", body)
-
-
 def _list_budgets() -> list:
     return _budget_request("GET", f"/api/v1/persons/{BUDGET_PERSON_ID}/budgets")
-
-
-def _cancelled_schedule_update(state: AgentState):
-    return {
-        "messages": [{"role": "assistant", "content": f'Cancelled — "{state["title"]}" was not scheduled.'}],
-        "title": None, "kind": None, "date": None, "days": None,
-    }
-
-
-def ask_date(state: AgentState):
-    if state.get("date"):  # slot filling
-        return Command(goto="finalize_schedule")
-    payload = date_interrupt(str(uuid.uuid4()), f'What date is "{state["title"]}"?', "date", "Date")
-    response = interrupt(payload)
-    if is_cancelled(response):
-        return Command(update=_cancelled_schedule_update(state), goto=END)
-    values = field_values(response, "date")
-    if not values:
-        return Command(update=_cancelled_schedule_update(state), goto=END)
-    return Command(update={"date": values[0]}, goto="finalize_schedule")
-
-
-def ask_days(state: AgentState):
-    if state.get("days"):  # slot filling
-        return Command(goto="finalize_schedule")
-    payload = choice_interrupt(
-        str(uuid.uuid4()), f'Which day(s) is "{state["title"]}" for?', "days", "Day(s)",
-        options=[(d, d) for d in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]], multiple=True,
-    )
-    response = interrupt(payload)
-    if is_cancelled(response):
-        return Command(update=_cancelled_schedule_update(state), goto=END)
-    days = field_values(response, "days")
-    if not days:
-        return Command(update=_cancelled_schedule_update(state), goto=END)
-    return Command(update={"days": days}, goto="finalize_schedule")
-
-
-def finalize_schedule(state: AgentState):
-    st = load_state()
-    task = {"id": st["next_id"], "title": state["title"], "kind": state["kind"], "date": state.get("date"), "days": state.get("days")}
-    st["tasks"].append(task)
-    st["next_id"] += 1
-    save_state(st)
-
-    if state["kind"] == "appointment":
-        summary = f'Scheduled "{state["title"]}" (#{task["id"]}) for {state["date"]}.'
-    else:
-        summary = f'Set a recurring reminder for "{state["title"]}" (#{task["id"]}) on {", ".join(state["days"])}.'
-
-    return {"messages": [{"role": "assistant", "content": summary}], "title": None, "kind": None, "date": None, "days": None}
-
-
-def ask_delete_confirm(state: AgentState):
-    st = load_state()
-    match = next((t for t in st["tasks"] if t["id"] == state["delete_id"]), None)
-    if not match:
-        return {"messages": [{"role": "assistant", "content": f"No task with id {state['delete_id']}."}], "delete_id": None}
-
-    payload = confirm_interrupt(str(uuid.uuid4()), f'Delete task #{match["id"]} "{match["title"]}"?')
-    response = interrupt(payload)
-
-    if is_confirmed(response):
-        st["tasks"] = [t for t in st["tasks"] if t["id"] != state["delete_id"]]
-        save_state(st)
-        summary = f'Deleted task #{match["id"]} ("{match["title"]}").'
-    else:
-        summary = "Cancelled — nothing was deleted."
-    return {"messages": [{"role": "assistant", "content": summary}], "delete_id": None}
 
 
 def ask_db_confirm(state: AgentState):
@@ -618,51 +413,263 @@ def ask_db_confirm(state: AgentState):
     return {"messages": [{"role": "assistant", "content": summary}], "pending_sql": None}
 
 
-def ask_transaction_confirm(state: AgentState):
-    args = state["pending_transaction"]
-    kind = "income" if args["type"] == "INCOME" else "expense"
-    category = f" ({args['category']})" if args.get("category") else ""
-    currency = args.get("currency") or ""
-    title = f"Record {kind} of {args['amount']} {currency}{category}?".replace("  ", " ")
-    payload = confirm_interrupt(str(uuid.uuid4()), title)
-    response = interrupt(payload)
+# ---- manual data entry (expense / income / budget / asset) via one prefilled bottom sheet ----
+#
+# The model only proposes values (open_entry_form prefill); it never writes anything. Every value is
+# re-validated here after the user submits the sheet, and the write uses an idempotency key derived
+# from form_id, which lives in checkpointed state — so a double submit or a node replay can't
+# double-post.
 
-    if is_confirmed(response):
-        try:
-            # A fresh key per confirmed call: retrying the SAME confirmed action would need its own
-            # dedup, but this app never automatically retries, so uniqueness here is enough to stop a
-            # duplicate double-click from posting twice without stopping two genuinely separate entries.
-            result = _create_transaction(
-                args["type"], args["amount"], args.get("currency"), args.get("category"),
-                args.get("description"), idempotency_key=f"chat-{uuid.uuid4()}",
-            )
-            summary = f"Recorded. New balance: {result['balanceAfter']} {result['currency']}."
-        except Exception as exc:
-            summary = f"Budget API error: {exc}"
+ENTRY_TYPES = ("EXPENSE", "INCOME", "BUDGET", "ASSET")
+MAX_FORM_ATTEMPTS = 3  # bounded re-ask loop when a submit fails validation
+_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
+_MAX_AMOUNT = Decimal("1000000000")
+
+CURRENCY_OPTIONS = [(c, c) for c in dict.fromkeys([DEFAULT_CURRENCY, "MYR", "EUR", "USD"])]
+CATEGORY_OPTIONS = {
+    "EXPENSE": ["groceries", "food", "transport", "rent", "bills", "shopping", "health", "entertainment"],
+    "INCOME": ["salary", "bonus", "refund", "gift", "investment"],
+    "BUDGET": ["groceries", "food", "transport", "shopping", "entertainment", "bills"],
+    "ASSET": ["electronics", "vehicle", "property", "jewelry", "furniture", "other"],
+}
+PERIOD_OPTIONS = [("WEEKLY", "Weekly"), ("MONTHLY", "Monthly"), ("YEARLY", "Yearly")]
+ENTRY_TITLES = {"EXPENSE": "Add expense", "INCOME": "Add income", "BUDGET": "Set budget", "ASSET": "Add asset"}
+_PREFILL_KEYS = ("name", "amount", "currency", "category", "date", "period", "description")
+
+
+def new_pending_entry(entry_type: str, prefill) -> dict:
+    """Whitelists and coerces LLM-proposed prefill: anything unknown or malformed is dropped rather
+    than trusted — the user sees the empty field and fills it in instead."""
+    clean = {}
+    for key, value in (prefill if isinstance(prefill, dict) else {}).items():
+        if key not in _PREFILL_KEYS or value in (None, ""):
+            continue
+        clean[key] = str(value).strip()[:255]
+    if clean.get("currency"):
+        clean["currency"] = clean["currency"].upper()
+    return {"form_id": str(uuid.uuid4()), "entry_type": entry_type, "prefill": clean}
+
+
+def _entry_fields(entry_type: str, values: dict, errors: dict) -> list:
+    today = datetime.date.today().isoformat()
+
+    def field(builder, name, *args, **kwargs):
+        f = builder(name, *args, **kwargs)
+        if errors.get(name):
+            f["error"] = errors[name]
+        return f
+
+    def category(label):
+        options = [(c, c.capitalize()) for c in CATEGORY_OPTIONS[entry_type]]
+        current = values.get("category")
+        known = current in CATEGORY_OPTIONS[entry_type]
+        f = field(choice_field, "category", label, options, default=current if known else None, allow_custom=True)
+        if current and not known:
+            f["custom_default"] = current  # a model/user-supplied category not in the preset chips
+        return f
+
+    currency = field(choice_field, "currency", "Currency", CURRENCY_OPTIONS,
+                     default=values.get("currency") or DEFAULT_CURRENCY, required=True, allow_custom=True)
+    if values.get("currency") and values["currency"] not in dict(CURRENCY_OPTIONS):
+        currency["default"], currency["custom_default"] = [], values["currency"]
+
+    if entry_type == "ASSET":
+        return [
+            field(form_field, "name", "text", "Item", values.get("name"), required=True, placeholder="e.g. iPhone 16"),
+            category("Asset category"),
+            field(form_field, "amount", "number", "Purchase price", values.get("amount"), required=True, min="0.01", step="0.01"),
+            currency,
+            field(form_field, "date", "date", "Purchase date", values.get("date") or today, required=True),
+            field(form_field, "description", "text", "Note", values.get("description"), placeholder="optional"),
+            field(choice_field, "record_expense", "Also record the price as an expense?",
+                  [("yes", "Yes"), ("no", "No")], default=values.get("record_expense") or "yes", required=True),
+        ]
+    if entry_type == "BUDGET":
+        return [
+            category("Category"),
+            field(form_field, "amount", "number", "Limit", values.get("amount"), required=True, min="0.01", step="0.01"),
+            currency,
+            field(choice_field, "period", "Period", PERIOD_OPTIONS, default=values.get("period") or "MONTHLY", required=True),
+            field(form_field, "date", "date", "Start date", values.get("date") or today, required=True),
+        ]
+    return [  # EXPENSE / INCOME
+        field(form_field, "amount", "number", "Amount", values.get("amount"), required=True, min="0.01", step="0.01"),
+        currency,
+        category("Category"),
+        field(form_field, "date", "date", "Date", values.get("date") or today, required=True),
+        field(form_field, "description", "text", "Description", values.get("description"), placeholder="optional"),
+    ]
+
+
+def _validate_entry(entry_type: str, response: dict):
+    """Returns (clean values, raw values echoed back, {field: error}). Server-side source of truth —
+    the client's required/min attributes are only a convenience."""
+    raw = {name: first_value(response, name) for name in
+           ("name", "amount", "currency", "category", "date", "period", "description", "record_expense")}
+    errors, clean = {}, {}
+
+    try:
+        amount = Decimal(raw["amount"].replace(",", "."))
+        if not (Decimal("0.01") <= amount <= _MAX_AMOUNT):
+            raise InvalidOperation
+        clean["amount"] = amount.quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
+        errors["amount"] = "Enter a positive amount, e.g. 1299.00"
+
+    currency = raw["currency"].upper()
+    if _CURRENCY_RE.match(currency):
+        clean["currency"] = currency
     else:
-        summary = "Cancelled — nothing was recorded."
-    return {"messages": [{"role": "assistant", "content": summary}], "pending_transaction": None}
+        errors["currency"] = "Use a 3-letter currency code, e.g. MYR"
+
+    try:
+        clean["date"] = datetime.date.fromisoformat(raw["date"])
+        if entry_type != "BUDGET" and clean["date"] > datetime.date.today():
+            errors["date"] = "Date can't be in the future"
+    except ValueError:
+        errors["date"] = "Pick a date"
+
+    clean["category"] = raw["category"][:64] or None
+    clean["description"] = raw["description"][:255] or None
+
+    if entry_type == "ASSET":
+        clean["name"] = raw["name"][:128]
+        if not clean["name"]:
+            errors["name"] = "What did you buy?"
+        clean["record_expense"] = raw["record_expense"] != "no"
+    if entry_type == "BUDGET":
+        if not clean["category"]:
+            errors["category"] = "A budget needs a category"
+        clean["period"] = raw["period"] if raw["period"] in dict(PERIOD_OPTIONS) else None
+        if not clean["period"]:
+            errors["period"] = "Pick a period"
+
+    raw["currency"] = currency
+    return clean, raw, errors
+
+
+def _occurred_at(day: datetime.date) -> str:
+    # budget API takes a LocalDateTime: "now" for today, noon for a past day (no time was asked).
+    if day == datetime.date.today():
+        return datetime.datetime.now().replace(microsecond=0).isoformat()
+    return datetime.datetime.combine(day, datetime.time(12, 0)).isoformat()
+
+
+def _list_assets() -> list:
+    return _budget_request("GET", f"/api/v1/persons/{BUDGET_PERSON_ID}/assets")
+
+
+def _create_asset(clean: dict, key: str) -> dict:
+    body = {
+        "personId": BUDGET_PERSON_ID, "name": clean["name"], "purchaseValue": str(clean["amount"]),
+        "currency": clean["currency"], "purchaseDate": clean["date"].isoformat(), "idempotencyKey": key,
+    }
+    if clean.get("category"):
+        body["category"] = clean["category"]
+    if clean.get("description"):
+        body["note"] = clean["description"]
+    return _budget_request("POST", "/api/v1/assets", body)
+
+
+def _format_assets_table(assets: list) -> str:
+    """Display-ready table, relayed verbatim by the model (same approach as _format_transactions_table)."""
+    if not assets:
+        return "No assets recorded yet."
+    lines = ["| # | Item | Category | Value | Purchased | Note |", "|---|---|---|---:|---|---|"]
+    totals = {}
+    for a in assets:
+        value = Decimal(str(a["purchaseValue"])).quantize(Decimal("0.01"))
+        totals[a["currency"]] = totals.get(a["currency"], Decimal("0")) + value
+        lines.append(f"| {a['id']} | {a['name']} | {a.get('category') or '-'} | {value} {a['currency']} "
+                     f"| {a['purchaseDate']} | {a.get('note') or '-'} |")
+    for currency, total in totals.items():
+        lines.append(f"| | **Total** | | **{total} {currency}** | | |")
+    return "\n".join(lines)
+
+
+def _post_transaction(type_: str, clean: dict, key: str, description: str = None) -> dict:
+    body = {
+        "personId": BUDGET_PERSON_ID, "type": type_, "amount": str(clean["amount"]), "currency": clean["currency"],
+        "occurredAt": _occurred_at(clean["date"]), "idempotencyKey": key,
+    }
+    if clean.get("category"):
+        body["category"] = clean["category"]
+    if description or clean.get("description"):
+        body["description"] = (description or clean["description"])[:255]
+    return _budget_request("POST", "/api/v1/transactions", body)
+
+
+def _commit_entry(entry_type: str, clean: dict, form_id: str) -> str:
+    key = f"entry-{form_id}"
+    if entry_type in ("EXPENSE", "INCOME"):
+        result = _post_transaction(entry_type, clean, key)
+        kind = entry_type.lower()
+        return f"Recorded {kind} of {clean['amount']} {clean['currency']}. New balance: {result['balanceAfter']} {result['currency']}."
+
+    if entry_type == "BUDGET":
+        _budget_request("POST", "/api/v1/budgets", {
+            "personId": BUDGET_PERSON_ID, "category": clean["category"], "limitAmount": str(clean["amount"]),
+            "currency": clean["currency"], "period": clean["period"], "startDate": clean["date"].isoformat(),
+        })
+        return f"Budget set: {clean['amount']} {clean['currency']} {clean['period'].lower()} for {clean['category']}."
+
+    asset = _create_asset(clean, f"asset-{form_id}")
+    summary = f"Added asset #{asset['id']} \"{asset['name']}\" ({clean['amount']} {asset['currency']})."
+    if clean["record_expense"]:
+        try:
+            result = _post_transaction("EXPENSE", clean, key, description=f"Purchase: {clean['name']}")
+            summary += f" Recorded the purchase as an expense — new balance: {result['balanceAfter']} {result['currency']}."
+        except Exception as exc:
+            # Asset is saved; only the expense failed. Say so explicitly — no silent partial write.
+            summary += f" The expense could NOT be recorded ({exc}); add it manually if needed."
+    return summary
+
+
+def entry_form(state: AgentState):
+    pending = state["pending_entry"]
+    entry_type, form_id = pending["entry_type"], pending["form_id"]
+    values, errors = dict(pending.get("prefill") or {}), {}
+    done = {"pending_entry": None}
+
+    for attempt in range(MAX_FORM_ATTEMPTS):
+        subtitle = "Please fix the highlighted fields." if errors else "Review, adjust anything, then save."
+        payload = form_interrupt(
+            f"{form_id}:{attempt}", ENTRY_TITLES[entry_type], _entry_fields(entry_type, values, errors),
+            subtitle=subtitle, submit_label="Save",
+        )
+        response = interrupt(payload)
+        if is_cancelled(response):
+            return {**done, "messages": [{"role": "assistant", "content": "Cancelled — nothing was saved."}]}
+
+        clean, values, errors = _validate_entry(entry_type, response)
+        if not errors:
+            try:
+                summary = _commit_entry(entry_type, clean, form_id)
+            except Exception as exc:
+                summary = f"Save failed — nothing was saved: {exc}"
+            return {**done, "messages": [{"role": "assistant", "content": summary}]}
+
+    return {**done, "messages": [{"role": "assistant", "content": "Too many invalid attempts — nothing was saved."}]}
 
 
 def route_after_agent(state: AgentState):
     return END  # Command(goto=...) handles every case that isn't a finished plain-text answer
 
 
+def route_start(state: AgentState):
+    # A manually opened sheet (web "+" button) skips the model entirely — deterministic, no tokens.
+    return "entry_form" if state.get("pending_entry") else "agent"
+
+
 graph_builder = StateGraph(AgentState)
 graph_builder.add_node("agent", agent_node)
-graph_builder.add_node("ask_date", ask_date)
-graph_builder.add_node("ask_days", ask_days)
-graph_builder.add_node("finalize_schedule", finalize_schedule)
-graph_builder.add_node("ask_delete_confirm", ask_delete_confirm)
 graph_builder.add_node("ask_db_confirm", ask_db_confirm)
-graph_builder.add_node("ask_transaction_confirm", ask_transaction_confirm)
+graph_builder.add_node("entry_form", entry_form)
 
-graph_builder.add_edge(START, "agent")
+graph_builder.add_conditional_edges(START, route_start, {"agent": "agent", "entry_form": "entry_form"})
 graph_builder.add_conditional_edges("agent", route_after_agent, {END: END})
-graph_builder.add_edge("finalize_schedule", END)
-graph_builder.add_edge("ask_delete_confirm", END)
 graph_builder.add_edge("ask_db_confirm", END)
-graph_builder.add_edge("ask_transaction_confirm", END)
+graph_builder.add_edge("entry_form", END)
 
 graph = graph_builder.compile(checkpointer=MemorySaver())
 
@@ -744,13 +751,20 @@ def ingest_file(thread_id: str, filename: str, text: str):
     graph.update_state(config, {"messages": [{"role": "system", "content": content}]})
 
 
-def run(thread_id: str, user_message: str = None, resume_value: dict = None):
-    """Returns {"type": "text", "message": ...} or {"type": "interrupt", "payload": ...}."""
+def run(thread_id: str, user_message: str = None, resume_value: dict = None, open_form: str = None):
+    """Returns {"type": "text", "message": ...} or {"type": "interrupt", "payload": ...}.
+    open_form=<entry type> opens an empty entry sheet directly, without a model call."""
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 25}
 
     try:
         if resume_value is not None:
             result = graph.invoke(Command(resume=resume_value), config)
+        elif open_form is not None:
+            entry_type = open_form.upper()
+            if entry_type not in ENTRY_TYPES:
+                return {"type": "error", "message": f"Unknown entry type: {open_form}"}
+            note = {"role": "user", "content": f"(Opened the {entry_type.lower()} entry form manually.)"}
+            result = graph.invoke({"messages": [note], "pending_entry": new_pending_entry(entry_type, {})}, config)
         else:
             messages = [{"role": "user", "content": user_message}]
             try:
@@ -779,6 +793,20 @@ def _terminal_resolve(payload):
     if field["type"] == "date":
         val = input(f"{field['label']} (YYYY-MM-DD, blank to cancel): ").strip()
         return {"cancelled": True} if not val else {"values": {field["name"]: [val]}}
+    if len(payload["fields"]) > 1 or field["type"] in ("text", "number"):
+        values = {}
+        for f in payload["fields"]:
+            default = (f.get("default") or [""])[0]
+            hint = f" [{default}]" if default else ""
+            if f["type"] == "choice":
+                hint += " (" + ", ".join(o["value"] for o in f["options"]) + ")"
+            if f.get("error"):
+                print(f"  ! {f['error']}")
+            val = input(f"{f['label']}{hint} (blank = keep, '-' = cancel): ").strip()
+            if val == "-":
+                return {"cancelled": True}
+            values[f["name"]] = [val or default] if (val or default) else []
+        return {"values": values}
     if field["type"] == "choice":
         print("Options:", ", ".join(o["label"] for o in field["options"]))
         val = input(f"{field['label']} (comma-separated, blank to cancel): ").strip()

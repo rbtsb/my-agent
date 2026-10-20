@@ -1,6 +1,6 @@
 """
-Web UI for the unified agent (agent_openrouter.py) — chat, RAG, tools, and every structured
-interrupt (date / day-of-week choice / yes-no confirm), all in one place.
+Web UI for BEMS Agent (agent_openrouter.py) — chat, RAG, budget & CRM tools, and every structured
+interrupt (entry forms / yes-no confirm), all in one place.
 
 Run:
     pip install -r requirements.txt
@@ -75,6 +75,22 @@ def upload():
 
     agent.ingest_file(THREAD_ID, filename, text)
     return jsonify({"type": "text", "message": f'📎 Uploaded "{filename}" — ask me anything about it.'})
+
+
+@app.route("/api/entry", methods=["POST"])
+def open_entry():
+    """Opens an empty entry sheet (expense/income/budget/asset) directly — the "+" button, no LLM."""
+    global pending_interrupt
+    if pending_interrupt:
+        return jsonify({"type": "error", "message": "Resolve the pending question first."}), 409
+
+    entry_type = str((request.json or {}).get("entry_type", "")).upper()
+    if entry_type not in agent.ENTRY_TYPES:
+        return jsonify({"type": "error", "message": f"Unknown entry type: {entry_type or '(none)'}"}), 400
+
+    result = agent.run(THREAD_ID, open_form=entry_type)
+    pending_interrupt = result["type"] == "interrupt"
+    return jsonify(result)
 
 
 @app.route("/api/resume", methods=["POST"])

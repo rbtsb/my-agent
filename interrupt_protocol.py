@@ -10,6 +10,13 @@ That's the whole contract — new field "type"s can be added later without break
   - "choice" — single/multi-select from a list, with an optional free-text fallback
   - "date"   — a single calendar date; web renders a native <input type="date">
   - "confirm" — a plain yes/no decision, rendered as two full-width buttons (not chips)
+  - "text"   — a single-line free-text input
+  - "number" — a numeric input (decimal); the answer is still returned as a string
+Any non-confirm field may also carry:
+  - "default"  — list of strings to prefill the field with (e.g. values the LLM extracted)
+  - "required" — client marks the field and blocks submit while it's empty (server re-validates)
+  - "error"    — a validation message from the previous submit, shown under the field
+A payload may carry a top-level "subtitle" and "submit_label" too.
 
 Interrupt payload (agent -> client):
 {
@@ -101,3 +108,37 @@ def field_values(response: dict, field_name: str) -> list[str]:
     """Pulls one field's answer out of a response payload, always as a list of strings."""
     values = response.get("values", {}).get(field_name, [])
     return values if isinstance(values, list) else [values]
+
+
+def form_field(name: str, type_: str, label: str, default=None, required: bool = False, **extra) -> dict:
+    """One field for form_interrupt. `default` is normalised to the protocol's list-of-strings shape."""
+    field = {"name": name, "type": type_, "label": label, "required": required}
+    if default not in (None, "", []):
+        field["default"] = [str(v) for v in default] if isinstance(default, list) else [str(default)]
+    field.update(extra)
+    return field
+
+
+def choice_field(name: str, label: str, options: list[tuple[str, str]], default=None, required: bool = False,
+                 multiple: bool = False, allow_custom: bool = False) -> dict:
+    return form_field(
+        name, "choice", label, default, required, multiple=multiple,
+        options=[{"value": value, "label": text} for value, text in options],
+        allow_custom=allow_custom, custom_label="Other (type your own)",
+    )
+
+
+def form_interrupt(interrupt_id: str, title: str, fields: list[dict], subtitle: str = None,
+                   submit_label: str = "Save") -> dict:
+    """A multi-field data-entry sheet (e.g. a prefilled expense/asset form)."""
+    payload = {"protocol": PROTOCOL_VERSION, "interrupt_id": interrupt_id, "title": title,
+               "fields": fields, "submit_label": submit_label}
+    if subtitle:
+        payload["subtitle"] = subtitle
+    return payload
+
+
+def first_value(response: dict, field_name: str) -> str:
+    """The field's first answer stripped, or "" when it was left empty."""
+    values = field_values(response, field_name)
+    return str(values[0]).strip() if values else ""

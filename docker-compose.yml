@@ -69,7 +69,7 @@ services:
       # host too — BUDGET_API_KEY/BUDGET_PERSON_ID still come from .env (env_file above).
       BUDGET_API_BASE_URL: http://host.docker.internal:8090
     volumes:
-      - .:/app # bind mount, not baked into the image — edits on the host apply without a rebuild, and tasks.json persists
+      - .:/app # bind mount, not baked into the image — edits on the host apply without a rebuild
     ports:
       - "5000:5000"
     extra_hosts:

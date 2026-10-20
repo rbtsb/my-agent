@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Agent Chat</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BEMS Agent</title>
 <style>
   :root {
     --bg: #f4f6fa; --card: #ffffff; --ink: #1b1f2b;
@@ -27,8 +28,17 @@
   #inputRow input[type=text] { flex: 1; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; font-size: 14px; background: var(--bg); }
   #inputRow button { padding: 12px 22px; border: none; border-radius: 10px; background: var(--blue); color: white; font-weight: 600; cursor: pointer; }
   #inputRow button:disabled { opacity: 0.5; cursor: default; }
+  #inputRow input[type=text] { min-width: 0; } /* lets the text box shrink instead of pushing Send off-screen */
+  @media (max-width: 560px) {
+    #inputRow { padding: 10px; gap: 6px; }
+    #inputRow button { padding: 12px 14px; }
+    #attach, #addEntry { padding: 12px; }
+    .msg { max-width: 88%; }
+    #chat { padding: 14px; }
+  }
   #attach { flex: 0 0 auto; padding: 12px 16px; background: var(--blue); font-size: 18px; display: flex; align-items: center; justify-content: center; }
-  #attach .icon { filter: brightness(0) invert(1); } /* forces the emoji glyph to render as plain white, not its default color */
+  #addEntry { flex: 0 0 auto; padding: 12px 16px; background: var(--blue); font-size: 16px; display: flex; align-items: center; justify-content: center; }
+  #attach .icon, #addEntry .icon { filter: brightness(0) invert(1); } /* forces the emoji glyph to render as plain white, not its default color */
 
   /* Bottom-sheet interrupt UI, styled after the Tunoo "Review & send" pattern — this markup
      knows nothing about "priority" or "days", only about field TYPES from interrupt_protocol.py,
@@ -60,6 +70,19 @@
   .sheet button.submit { width: 100%; padding: 15px; border: none; border-radius: 12px; background: var(--blue); color: white; font-weight: 700; font-size: 16px; cursor: pointer; margin-top: 6px; }
   .sheet button.submit:disabled { opacity: 0.5; cursor: default; }
 
+  .sheet .subtitle { text-align: center; font-size: 13px; color: var(--muted); margin: -12px 0 16px; }
+  .sheet { max-height: 92vh; display: flex; flex-direction: column; }
+  .sheet .body { flex: 1 1 auto; min-height: 0; overflow-y: auto; margin-bottom: 6px; }
+  .field .label .req { color: #c0392b; margin-left: 2px; }
+  .field.invalid { box-shadow: inset 0 0 0 1.5px #c0392b; }
+  .field .field-error { color: #c0392b; font-size: 12px; margin-top: 6px; }
+  .text-input { width: 100%; padding: 10px 12px; border: 1px solid #cfd8ef; border-radius: 8px; background: white; font-size: 15px; }
+
+  .entry-types { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+  .entry-types button { padding: 18px 10px; border: 1px solid #cfd8ef; border-radius: 14px; background: white; font-size: 15px; font-weight: 600; cursor: pointer; color: var(--ink); }
+  .entry-types button span { display: block; font-size: 24px; margin-bottom: 6px; }
+  .entry-types button:hover { border-color: var(--blue); background: #dce8ff; }
+
   .date-input { width: 100%; padding: 10px 12px; border: 1px solid #cfd8ef; border-radius: 8px; background: white; font-size: 15px; }
 
   .confirm-buttons { display: flex; gap: 10px; }
@@ -69,10 +92,11 @@
 </style>
 </head>
 <body>
-  <header>Agent Chat<small>Tasks, weather, CRM lookups, and company knowledge — all in one place</small></header>
+  <header>BEMS Agent<small>Company knowledge, your budget and CRM lookups — all in one place</small></header>
   <div id="chat"></div>
   <div id="inputRow">
     <button id="attach" title="Attach a file"><span class="icon">📎</span></button>
+    <button id="addEntry" title="Add expense, income, budget or asset"><span class="icon">➕</span></button>
     <input id="fileInput" type="file" accept=".txt,.md,.csv,.json,.pdf,.docx,.xlsx,.pptx,.jpg,.jpeg,.png" hidden />
     <input id="input" type="text" placeholder="Type a message..." autofocus />
     <button id="send">Send</button>
@@ -88,6 +112,7 @@ const overlay = document.getElementById("overlay");
 const sheet = document.getElementById("sheet");
 const attachBtn = document.getElementById("attach");
 const fileInput = document.getElementById("fileInput");
+const addEntryBtn = document.getElementById("addEntry");
 
 // Minimal, safe Markdown rendering for bot messages: pipe tables and **bold** only — everything
 // else stays plain text. Builds real DOM nodes throughout (no innerHTML of model-controlled text),
@@ -183,6 +208,7 @@ function setBusy(busy) {
   sendBtn.disabled = busy;
   input.disabled = busy;
   attachBtn.disabled = busy;
+  addEntryBtn.disabled = busy;
   // Disabling an input drops browser focus even after re-enabling it — put it back so the user
   // can keep typing without an extra click.
   if (!busy) input.focus();
@@ -210,17 +236,27 @@ async function submitCancel(payload) {
 
 // Renders ANY interrupt_protocol.py payload as a bottom sheet — adding a new field "type"
 // later only needs a new branch here, the protocol shape itself doesn't change.
-function renderInterrupt(payload) {
+function sheetHeader(title, subtitle) {
   sheet.innerHTML = "";
-
   const handle = document.createElement("div");
   handle.className = "handle";
   sheet.appendChild(handle);
 
   const titleEl = document.createElement("div");
   titleEl.className = "title";
-  titleEl.textContent = payload.title;
+  titleEl.textContent = title;
   sheet.appendChild(titleEl);
+
+  if (subtitle) {
+    const sub = document.createElement("div");
+    sub.className = "subtitle";
+    sub.textContent = subtitle;
+    sheet.appendChild(sub);
+  }
+}
+
+function renderInterrupt(payload) {
+  sheetHeader(payload.title, payload.subtitle);
 
   // "confirm" is a self-contained yes/no decision — it submits itself on click, no separate
   // submit button, no other field types alongside it.
@@ -228,29 +264,50 @@ function renderInterrupt(payload) {
     const field = payload.fields[0];
     const row = document.createElement("div");
     row.className = "confirm-buttons";
-    row.innerHTML = `<button class="no">${field.no_label}</button><button class="yes">${field.yes_label}</button>`;
-    row.querySelector(".yes").onclick = () => submitResume(payload, { [field.name]: ["yes"] });
-    row.querySelector(".no").onclick = () => submitResume(payload, { [field.name]: ["no"] });
+    const no = document.createElement("button");
+    no.className = "no";
+    no.textContent = field.no_label;
+    no.onclick = () => submitResume(payload, { [field.name]: ["no"] });
+    const yes = document.createElement("button");
+    yes.className = "yes";
+    yes.textContent = field.yes_label;
+    yes.onclick = () => submitResume(payload, { [field.name]: ["yes"] });
+    row.append(no, yes);
     sheet.appendChild(row);
     overlay.classList.add("open");
     return;
   }
 
-  const fieldEls = {}; // name -> {getValues(): string[]}
+  const body = document.createElement("div");
+  body.className = "body";
+  sheet.appendChild(body);
+
+  const fieldEls = {}; // name -> {getValues(): string[], el, field}
 
   payload.fields.forEach((field) => {
+    const defaults = field.default || [];
     const fieldDiv = document.createElement("div");
-    fieldDiv.className = "field";
+    fieldDiv.className = "field" + (field.error ? " invalid" : "");
 
     const label = document.createElement("div");
     label.className = "label";
     label.textContent = field.label;
+    if (field.required) {
+      const req = document.createElement("span");
+      req.className = "req";
+      req.textContent = "*";
+      label.appendChild(req);
+    }
     fieldDiv.appendChild(label);
 
     if (field.type === "choice") {
       const optionRow = document.createElement("div");
       optionRow.className = "option-row";
       const optionEls = [];
+      let customInput = null;
+
+      const syncChipStyles = () =>
+        optionEls.forEach((o) => o.closest(".option").classList.toggle("checked", o.checked));
 
       field.options.forEach((opt) => {
         const chip = document.createElement("label");
@@ -259,32 +316,44 @@ function renderInterrupt(payload) {
         optInput.type = field.multiple ? "checkbox" : "radio";
         optInput.name = field.name;
         optInput.value = opt.value;
+        optInput.checked = defaults.includes(opt.value);
         optInput.style.display = "none";
-        optInput.onchange = () => syncChipStyles();
         chip.appendChild(optInput);
         chip.appendChild(document.createTextNode(opt.label));
-        chip.onclick = (e) => { e.preventDefault(); optInput.checked = field.multiple ? !optInput.checked : true; if (!field.multiple) optionEls.forEach(o => { if (o !== optInput) o.checked = false; }); syncChipStyles(); };
+        chip.onclick = (e) => {
+          e.preventDefault();
+          optInput.checked = field.multiple ? !optInput.checked : true;
+          if (!field.multiple) {
+            optionEls.forEach((o) => { if (o !== optInput) o.checked = false; });
+            if (customInput) customInput.value = ""; // a chip and a typed value are mutually exclusive
+          }
+          syncChipStyles();
+        };
         optionRow.appendChild(chip);
         optionEls.push(optInput);
       });
       fieldDiv.appendChild(optionRow);
+      syncChipStyles();
 
-      function syncChipStyles() {
-        optionEls.forEach((o) => o.closest(".option").classList.toggle("checked", o.checked));
-      }
-
-      let customInput = null;
       if (field.allow_custom) {
         const row = document.createElement("div");
         row.className = "custom-row";
         customInput = document.createElement("input");
         customInput.type = "text";
         customInput.placeholder = field.custom_label;
+        customInput.value = field.custom_default || "";
+        customInput.oninput = () => {
+          if (!field.multiple && customInput.value.trim()) {
+            optionEls.forEach((o) => { o.checked = false; });
+            syncChipStyles();
+          }
+        };
         row.appendChild(customInput);
         fieldDiv.appendChild(row);
       }
 
       fieldEls[field.name] = {
+        field, el: fieldDiv,
         getValues() {
           const values = [];
           field.options.forEach((opt, i) => { if (optionEls[i].checked) values.push(opt.value); });
@@ -294,15 +363,29 @@ function renderInterrupt(payload) {
       };
     }
 
-    if (field.type === "date") {
-      const dateInput = document.createElement("input");
-      dateInput.type = "date";
-      dateInput.className = "date-input";
-      fieldDiv.appendChild(dateInput);
-      fieldEls[field.name] = { getValues: () => (dateInput.value ? [dateInput.value] : []) };
+    if (field.type === "date" || field.type === "text" || field.type === "number") {
+      const inputEl = document.createElement("input");
+      inputEl.type = field.type;
+      inputEl.className = field.type === "date" ? "date-input" : "text-input";
+      if (field.placeholder) inputEl.placeholder = field.placeholder;
+      if (field.type === "number") {
+        inputEl.inputMode = "decimal";
+        if (field.min) inputEl.min = field.min;
+        if (field.step) inputEl.step = field.step;
+      }
+      inputEl.value = defaults[0] || "";
+      fieldDiv.appendChild(inputEl);
+      fieldEls[field.name] = { field, el: fieldDiv, getValues: () => (inputEl.value.trim() ? [inputEl.value.trim()] : []) };
     }
 
-    sheet.appendChild(fieldDiv);
+    if (field.error) {
+      const err = document.createElement("div");
+      err.className = "field-error";
+      err.textContent = field.error;
+      fieldDiv.appendChild(err);
+    }
+
+    body.appendChild(fieldDiv);
   });
 
   const buttonRow = document.createElement("div");
@@ -316,10 +399,19 @@ function renderInterrupt(payload) {
 
   const submitBtn = document.createElement("button");
   submitBtn.className = "yes";
-  submitBtn.textContent = "Confirm";
+  submitBtn.textContent = payload.submit_label || "Confirm";
   submitBtn.onclick = () => {
     const values = {};
-    for (const name in fieldEls) values[name] = fieldEls[name].getValues();
+    let missing = null;
+    for (const name in fieldEls) {
+      const { field, el, getValues } = fieldEls[name];
+      values[name] = getValues();
+      const empty = field.required && values[name].length === 0;
+      el.classList.toggle("invalid", empty);
+      if (empty && !missing) missing = el;
+    }
+    // Client-side check is only for convenience — the agent re-validates everything.
+    if (missing) { missing.scrollIntoView({ block: "center", behavior: "smooth" }); return; }
     submitBtn.disabled = true;
     submitResume(payload, values);
   };
@@ -327,6 +419,45 @@ function renderInterrupt(payload) {
 
   sheet.appendChild(buttonRow);
   overlay.classList.add("open");
+}
+
+// Local chooser for the "+" button — purely client-side; picking a type asks the server to open
+// the real (server-owned) entry form, so validation and saving stay in one place.
+function openEntryChooser() {
+  sheetHeader("What do you want to add?", null);
+  const grid = document.createElement("div");
+  grid.className = "entry-types";
+  [["EXPENSE", "💸", "Expense"], ["INCOME", "💰", "Income"], ["BUDGET", "📊", "Budget"], ["ASSET", "📱", "Asset"]]
+    .forEach(([type, icon, text]) => {
+      const btn = document.createElement("button");
+      const iconEl = document.createElement("span");
+      iconEl.textContent = icon;
+      btn.append(iconEl, document.createTextNode(text));
+      btn.onclick = () => openEntryForm(type);
+      grid.appendChild(btn);
+    });
+  sheet.appendChild(grid);
+
+  const row = document.createElement("div");
+  row.className = "confirm-buttons";
+  const close = document.createElement("button");
+  close.className = "no";
+  close.textContent = "Close";
+  close.onclick = () => overlay.classList.remove("open");
+  row.appendChild(close);
+  sheet.appendChild(row);
+  overlay.classList.add("open");
+}
+
+async function openEntryForm(entryType) {
+  overlay.classList.remove("open");
+  setBusy(true);
+  const res = await fetch("/api/entry", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ entry_type: entryType }),
+  });
+  handleResult(await res.json());
 }
 
 function handleResult(result) {
@@ -368,6 +499,7 @@ async function uploadFile(file) {
 sendBtn.onclick = send;
 input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
 attachBtn.onclick = () => fileInput.click();
+addEntryBtn.onclick = openEntryChooser;
 fileInput.addEventListener("change", () => {
   if (fileInput.files[0]) uploadFile(fileInput.files[0]);
   fileInput.value = ""; // allow re-selecting the same file later
